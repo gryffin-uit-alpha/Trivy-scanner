@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trivy-report"
+version = "0.1.0"
+description = "Markdown vulnerability reports with historical trends from Trivy JSON scan results"
+requires-python = ">=3.11"
+
+# Zero runtime dependencies. Constitution v1.0.0 Principle II: runtime code imports
+# only the Python standard library. Adding an entry here requires a Complexity
+# Tracking entry in specs/001-trivy-vuln-reports/plan.md naming what it buys and
+# what stdlib approach was rejected. Enforced by
+# tests/integration/test_no_runtime_dependencies.py.
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+trivy-report = "trivy_report.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+# A handful of tests import shared helpers as ``from tests.conftest import ...``,
+# which needs the repository root on sys.path. ``python -m pytest`` adds it
+# implicitly; the bare ``pytest`` entry point does not, and the documented command
+# is the bare one. Setting it here makes both invocations behave the same.
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+# Design documents under specs/ contain illustrative Python blocks that are
+# aligned for readability, not for the formatter. Reformatting them would rewrite
+# the spec to match the code, which is backwards — the spec is the contract.
+extend-exclude = ["specs", ".specify"]
+
+[tool.ruff.lint.isort]
+# `pipeline/` is first-party too. It is not in `src` because it is deliberately not
+# part of the distribution — see pipeline/__init__.py — but sorting its imports into
+# the third-party block would imply it is somebody else's code.
+known-first-party = ["trivy_report", "pipeline"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "PTH", # flake8-use-pathlib
+]
