@@ -1,0 +1,367 @@
+# Image vulnerability scanner — central orchestrator.
+#
+# Runs nightly. Renders every configured GitOps repository's overlays, scans the
+# images they declare with Trivy, and turns the results into Markdown reports with
+# day-over-day trends.
+#
+# Job graph:
+#
+#   prepare ──┬─> scan_<repo_a> ──┐
+#             └─> scan_<repo_b> ──┴─> report ──> gate
+#
+#   prepare   Stamps the one scan date the whole run shares, and warms the Trivy DB
+#             cache so the fan-out downloads it once instead of once per repository.
+#   scan_*    One job per repository. Independent: a broken repository degrades that
+#             repository's coverage, not the run.
+#   report    Fan-in. Merges the fragments, runs the Python application, publishes
+#             the reports and the rolling history. Succeeds for exit codes 0, 2 and
+#             3 so that a threshold breach can never stop history from being saved.
+#   gate      Turns the application's exit code into the build result. With `failOn`
+#             empty (the default) exit 3 is impossible, so this job only surfaces
+#             parse failures — it stays wired so a threshold is one variable away.
+#
+# Adding a repository means editing this file only, in three places, all marked
+# "ADD A REPOSITORY HERE". No Python change is required — see pipeline/README.md.
+
+name: trivy-scan-$(Date:yyyyMMdd)$(Rev:.r)
+
+# Nightly, and manual on demand. Deliberately not on push: history holds one entry
+# per scan date, so extra same-day runs only rewrite that date (which the
+# application does correctly, but which tells nobody anything new).
+trigger: none
+pr: none
+
+parameters:
+  - name: registryCredentials
+    type: boolean
+    default: false
+    displayName: Images live in a private registry (use the trivy-scanner-secrets group)
+    # False while the images being scanned are public. Trivy is given no credentials
+    # at all in that mode, which is not the same as being given empty ones: an
+    # undefined `$(TRIVY_USERNAME)` reaches the container as the literal macro text
+    # and turns every pull into a 401.
+    #
+    # Set true once Artifactory access exists and the variable group is created.
+    # It is a compile-time parameter because `- group:` cannot be evaluated at
+    # runtime — referencing a group that does not exist fails the whole pipeline
+    # before any job starts.
+
+schedules:
+  - cron: '0 2 * * *'
+    displayName: Nightly image vulnerability scan
+    branches:
+      include:
+        - main
+    always: true
+
+resources:
+  repositories:
+    # ADD A REPOSITORY HERE (1/3). `resources.repositories` must be static YAML —
+    # Azure DevOps resolves it before the run starts, so it cannot be generated from
+    # a config file. Keeping the list in this file is what makes adding a repository
+    # a single reviewable pull request.
+    # `name` is `Repo` for a repository in this project, or `Project/Repo` for one in
+    # another project.
+    - repository: git_ops_1
+      type: git
+      name: Git-ops-1
+      ref: refs/heads/main
+    - repository: git_ops_2
+      type: git
+      name: Git-ops-2
+      ref: refs/heads/main
+
+variables:
+  - ${{ if parameters.registryCredentials }}:
+      # TRIVY_USERNAME and TRIVY_PASSWORD live here, both marked secret. A variable
+      # group keeps the Artifactory identity token out of this file and out of every log.
+      - group: trivy-scanner-secrets
+  - ${{ else }}:
+      # Public registry: define them empty so the scan step maps empty strings rather
+      # than unresolved macros. `scan_images.sh` forwards both by name, and Trivy
+      # treats an empty username as no credentials.
+      - name: TRIVY_USERNAME
+        value: ''
+      - name: TRIVY_PASSWORD
+        value: ''
+
+  - name: trivyImage
+    value: 'aquasec/trivy:0.73.0'
+    # Pinned. Trivy's JSON is a contract this application parses
+    # (contracts/trivy-input.md, verified against 0.73.0); an unpinned scanner could
+    # change that contract overnight. Point this at an Artifactory mirror if the
+    # agent cannot reach Docker Hub.
+  - name: trivyDbRepository
+    value: ''
+    # Optional mirror for the vulnerability database. Trivy reads
+    # TRIVY_DB_REPOSITORY itself; leave empty to use the default.
+  - name: trivyTimeout
+    value: '10m'
+  - name: trivyCacheDir
+    value: '$(Pipeline.Workspace)/.trivy-cache'
+
+  - name: retentionDays
+    value: '90'
+    # The application prunes the history directory to this window. Because every run
+    # republishes the whole directory, this — not Azure DevOps retention — is what
+    # defines how much history exists.
+  - name: failOn
+    value: ''
+    # Empty on purpose: this is a daily *report*, not a merge gate. A nightly build
+    # that fails every night from the first permanent CRITICAL onward stops being read,
+    # and the trend table is the actual signal. Gating belongs on the path that ships
+    # an image, not on the one that observes it.
+    #
+    # To enable: a space-separated list of SEVERITY=COUNT, e.g. 'CRITICAL=1 HIGH=25'.
+    # Evaluated against the unique-image grand total.
+
+  - name: historyArtifact
+    value: 'scan-history'
+  - name: reportsArtifact
+    value: 'vulnerability-reports'
+
+  - name: scannedRepositories
+    # ADD A REPOSITORY HERE (2/3). Used only to warn when a repository produced no
+    # results, so a silently skipped repository cannot look like a clean one.
+    value: 'Git-ops-1,Git-ops-2'
+
+jobs:
+  - job: prepare
+    displayName: Prepare scan date and Trivy DB
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+      - checkout: none
+
+      - bash: |
+          set -euo pipefail
+          # The one clock read in the whole system. Every downstream consumer,
+          # including the Python application, is handed this value explicitly, so
+          # a run that spans midnight cannot end up with two scan dates.
+          scan_date="$(date -u +%Y-%m-%d)"
+          echo "scan date (UTC): $scan_date"
+          echo "##vso[task.setvariable variable=scanDate;isOutput=true]$scan_date"
+        name: scanDate
+        displayName: Stamp the scan date (UTC, once per run)
+
+      - task: Cache@2
+        displayName: Restore or seed the Trivy vulnerability DB
+        inputs:
+          key: 'trivy-db | v1 | "$(scanDate.scanDate)"'
+          path: $(trivyCacheDir)
+          cacheHitVar: TRIVY_DB_CACHE_HIT
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(trivyCacheDir)"
+          # Forwarded by name, and only when non-empty: Trivy reaches the DB repository
+          # from inside the container, so on a proxy-only network it fails without the
+          # proxy variables — while an empty TRIVY_DB_REPOSITORY would override the
+          # default with nothing. Unset on the agent means unset in the container.
+          env_args=()
+          for var in TRIVY_DB_REPOSITORY HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+            [[ -n "${!var:-}" ]] && env_args+=(-e "$var")
+          done
+
+          docker run --rm \
+            "${env_args[@]}" \
+            -v "$(trivyCacheDir):/root/.cache/trivy" \
+            "$(trivyImage)" image --download-db-only
+        displayName: Download the vulnerability DB
+        condition: ne(variables.TRIVY_DB_CACHE_HIT, 'true')
+        env:
+          TRIVY_DB_REPOSITORY: $(trivyDbRepository)
+
+  # ADD A REPOSITORY HERE (3/3).
+  - template: templates/scan-repo.yml
+    parameters:
+      repository: Git-ops-1
+      checkout: git_ops_1
+      overlays:
+        - overlays/production
+
+  - template: templates/scan-repo.yml
+    parameters:
+      repository: Git-ops-2
+      checkout: git_ops_2
+      overlays:
+        - overlays/production
+        - overlays/production-eu
+
+  - job: report
+    displayName: Generate reports and persist history
+    # Depends on every scanning job, but conditioned only on `prepare`: a repository
+    # that failed to scan must still get a report for every repository that did.
+    dependsOn:
+      - prepare
+      - scan_Git_ops_1
+      - scan_Git_ops_2
+    condition: succeeded('prepare')
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      scanDate: $[ dependencies.prepare.outputs['scanDate.scanDate'] ]
+      scansDir: $(Pipeline.Workspace)/scans
+      inputDir: $(Pipeline.Workspace)/input
+      historyDir: $(Pipeline.Workspace)/history
+      outputDir: $(Pipeline.Workspace)/output
+      missingFile: $(Pipeline.Workspace)/missing-repositories.txt
+    steps:
+      - checkout: self
+        fetchDepth: 1
+        displayName: Check out the scanner repository
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download this run's scan results
+        continueOnError: true
+        inputs:
+          buildType: current
+          patterns: 'scan-*/**'
+          targetPath: $(scansDir)
+        # Non-blocking: with no artifacts at all the merge step fails with a message
+        # that says why, which is more useful than a download task's error.
+
+      - task: DownloadPipelineArtifact@2
+        displayName: Download the previous history (non-blocking)
+        continueOnError: true
+        inputs:
+          buildType: specific
+          project: $(System.TeamProjectId)
+          definition: $(System.DefinitionId)
+          buildVersionToDownload: latestFromBranch
+          branchName: $(Build.SourceBranch)
+          # A run that meets the threshold is a *failed* run, and it holds the newest
+          # history. Excluding failed and partially-succeeded runs would freeze the
+          # baseline the first day a CRITICAL appears — which is the day trends start
+          # to matter.
+          allowFailedBuilds: true
+          allowPartiallySucceededBuilds: true
+          artifactName: $(historyArtifact)
+          targetPath: $(historyDir)
+        # continueOnError because the first ever run has no previous artifact. An
+        # absent baseline is a supported state: the application reports every count
+        # as new rather than failing.
+
+      - bash: |
+          set -euo pipefail
+          mkdir -p "$(inputDir)" "$(historyDir)" "$(outputDir)"
+
+          shopt -s nullglob
+          copied=0
+          for results in "$(scansDir)"/scan-*/results; do
+            cp -R "$results/." "$(inputDir)/"
+            copied=$((copied + 1))
+          done
+          echo "assembled results from $copied repository artifact(s)"
+
+          carried=("$(historyDir)"/*.json)
+          echo "history entries carried forward: ${#carried[@]}"
+        displayName: Assemble the input tree and history directory
+
+      - bash: |
+          set -euo pipefail
+          python3 -m pipeline.scripts.merge_manifests \
+            --fragments-dir "$(scansDir)" \
+            --scan-date "$(scanDate)" \
+            --expect "$(scannedRepositories)" \
+            --missing-out "$(missingFile)" \
+            --out "$(inputDir)/manifest.json"
+
+          while IFS= read -r repo; do
+            [ -z "$repo" ] && continue
+            echo "##vso[task.logissue type=warning]$repo produced no scan results; it will be reported as unscanned"
+          done <"$(missingFile)"
+        displayName: Merge manifest fragments
+        workingDirectory: $(Build.SourcesDirectory)
+
+      - bash: |
+          set -uo pipefail
+
+          # Read through the environment rather than as a $(macro): a macro holding
+          # spaces sitting in bash command position is a footgun waiting for the day
+          # somebody adds a second threshold.
+          fail_on_args=()
+          for threshold in ${FAIL_ON:-}; do
+            fail_on_args+=(--fail-on "$threshold")
+          done
+
+          # PYTHONPATH instead of `pip install`: the application has zero runtime
+          # dependencies, so there is nothing to resolve and no reason to touch a
+          # package index from a build agent.
+          PYTHONPATH=src python3 -m trivy_report \
+            --input "$(inputDir)" \
+            --manifest "$(inputDir)/manifest.json" \
+            --history-dir "$(historyDir)" \
+            --output-dir "$(outputDir)" \
+            --scan-date "$(scanDate)" \
+            --retention-days "$(retentionDays)" \
+            "${fail_on_args[@]}"
+          code=$?
+
+          echo "trivy-report exited $code"
+          echo "##vso[task.setvariable variable=reportExitCode;isOutput=true]$code"
+
+          # This step must succeed for 0, 2 and 3 so the publish steps below run and
+          # today's history survives. The gate job turns 3 into a build failure.
+          case "$code" in
+            0) echo 'no threshold met' ;;
+            2) echo "##vso[task.logissue type=warning]some scan results could not be parsed; the reports name them" ;;
+            3) echo "##vso[task.logissue type=warning]severity threshold met; the gate job will fail this build" ;;
+            1) echo "##vso[task.logissue type=error]report generation failed; nothing was written"; exit 1 ;;
+            *) echo "##vso[task.logissue type=error]unexpected exit code $code"; exit 1 ;;
+          esac
+          exit 0
+        name: runReport
+        displayName: Generate reports (exit 3 does not fail this job)
+        workingDirectory: $(Build.SourcesDirectory)
+        env:
+          FAIL_ON: $(failOn)
+
+      - publish: $(outputDir)
+        artifact: $(reportsArtifact)
+        displayName: Publish the Markdown reports
+
+      - publish: $(historyDir)
+        artifact: $(historyArtifact)
+        displayName: Publish the rolling history archive
+        # The WHOLE directory, not just today's entry: this artifact is the only
+        # copy of the 90-day archive, and the next run's baseline comes from it.
+
+  - job: gate
+    displayName: Evaluate the scan outcome
+    dependsOn: report
+    condition: succeededOrFailed()
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      reportExitCode: $[ dependencies.report.outputs['runReport.reportExitCode'] ]
+    steps:
+      - checkout: none
+      - bash: |
+          set -euo pipefail
+          code="${REPORT_EXIT_CODE:-}"
+
+          if [ -z "$code" ]; then
+            echo "##vso[task.logissue type=error]the report job produced no exit code; it did not reach the report step"
+            exit 1
+          fi
+
+          case "$code" in
+            0) echo 'Scan clean against the configured thresholds.' ;;
+            2) echo "##vso[task.logissue type=warning]Reports are complete but some results failed to parse (exit 2)." ;;
+            3)
+              echo "##vso[task.logissue type=error]Vulnerability threshold met (exit 3). Reports and history were published."
+              exit 1
+              ;;
+            1)
+              echo "##vso[task.logissue type=error]Report generation failed (exit 1). Nothing was written or published."
+              exit 1
+              ;;
+            *)
+              echo "##vso[task.logissue type=error]Unexpected report exit code $code."
+              exit 1
+              ;;
+          esac
+        displayName: Evaluate the threshold result
+        env:
+          REPORT_EXIT_CODE: $(reportExitCode)

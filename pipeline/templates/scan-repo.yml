@@ -1,0 +1,114 @@
+# Fan-out job: render one GitOps repository's overlays, discover its images, scan
+# them with Trivy, and publish the results plus a manifest fragment.
+#
+# One instance of this template per configured repository. The jobs are independent
+# on purpose: a repository whose overlays fail to render must not stop the others,
+# and the fan-in job tolerates a missing fragment (the report names the repository
+# as unscanned rather than reporting it clean).
+
+parameters:
+  - name: repository
+    type: string
+    # The name written into the manifest. It titles the per-repository report and
+    # is the trend key, so changing it starts a new trend line.
+  - name: checkout
+    type: string
+    # The `resources.repositories` alias to check out.
+  - name: overlays
+    type: object
+    default: []
+    # Paths inside the repository to render with `kubectl kustomize`.
+
+jobs:
+  - job: scan_${{ replace(parameters.repository, '-', '_') }}
+    displayName: Scan ${{ parameters.repository }}
+    dependsOn: prepare
+    pool:
+      vmImage: ubuntu-latest
+    variables:
+      scanDate: $[ dependencies.prepare.outputs['scanDate.scanDate'] ]
+      scannerRoot: $(Build.SourcesDirectory)/scanner
+      gitopsRoot: $(Build.SourcesDirectory)/gitops
+      stagingDir: $(Pipeline.Workspace)/staging
+      # Rendered manifests stay OUT of the published artifact: a GitOps overlay may
+      # contain Secret resources, and an artifact is readable by anyone with access
+      # to the run. Only image references and scan results are published.
+      renderedFile: $(Agent.TempDirectory)/rendered.yaml
+    steps:
+      - checkout: self
+        path: s/scanner
+        fetchDepth: 1
+        displayName: Check out the scanner repository
+
+      - checkout: ${{ parameters.checkout }}
+        path: s/gitops
+        fetchDepth: 1
+        submodules: false
+        displayName: Check out ${{ parameters.repository }}
+
+      - task: Cache@2
+        displayName: Restore the Trivy vulnerability DB
+        inputs:
+          # Same key the prepare job wrote, so the DB is downloaded once per day
+          # for the whole fan-out rather than once per repository.
+          key: 'trivy-db | v1 | "$(scanDate)"'
+          path: $(trivyCacheDir)
+          cacheHitVar: TRIVY_DB_CACHE_HIT
+
+      - bash: |
+          set -euo pipefail
+          IFS=';' read -ra overlays <<<"$OVERLAYS"
+          if [[ ${#overlays[@]} -eq 0 || -z "${overlays[0]}" ]]; then
+            echo "error: no overlays configured for ${{ parameters.repository }}" >&2
+            exit 1
+          fi
+          "$(scannerRoot)/pipeline/scripts/render_overlays.sh" \
+            "$(gitopsRoot)" \
+            "$(renderedFile)" \
+            "${overlays[@]}"
+        displayName: Render overlays with kubectl kustomize
+        env:
+          OVERLAYS: ${{ join(';', parameters.overlays) }}
+
+      - bash: |
+          set -euo pipefail
+          python3 -m pipeline.scripts.discover_images \
+            --rendered "$(renderedFile)" \
+            --out "$(stagingDir)/images.json"
+        displayName: Discover image references
+        workingDirectory: $(scannerRoot)
+
+      - bash: |
+          set -euo pipefail
+          python3 -m pipeline.scripts.make_manifest \
+            --repository "${{ parameters.repository }}" \
+            --images-json "$(stagingDir)/images.json" \
+            --fragment-out "$(stagingDir)/manifest-fragment.json" \
+            --plan-out "$(stagingDir)/plan.tsv" \
+            --generator "azure-pipelines/$(Build.DefinitionName)@$(Build.BuildId)"
+          echo "scan plan:"
+          cat "$(stagingDir)/plan.tsv"
+        displayName: Produce the manifest fragment and scan plan
+        workingDirectory: $(scannerRoot)
+
+      - bash: |
+          set -euo pipefail
+          "$(scannerRoot)/pipeline/scripts/scan_images.sh" \
+            "$(stagingDir)/plan.tsv" \
+            "$(stagingDir)/results"
+        displayName: Scan images with Trivy
+        env:
+          TRIVY_IMAGE: $(trivyImage)
+          TRIVY_CACHE_DIR: $(trivyCacheDir)
+          TRIVY_TIMEOUT: $(trivyTimeout)
+          TRIVY_DB_REPOSITORY: $(trivyDbRepository)
+          # Secret variables are never injected into the environment implicitly;
+          # mapping them here is what makes them visible to Trivy, and keeping the
+          # mapping to this one step keeps them out of every other process.
+          TRIVY_USERNAME: $(TRIVY_USERNAME)
+          TRIVY_PASSWORD: $(TRIVY_PASSWORD)
+          TRIVY_SKIP_DB_UPDATE: $(TRIVY_DB_CACHE_HIT)
+
+      - publish: $(stagingDir)
+        artifact: scan-${{ parameters.repository }}
+        displayName: Publish results and manifest fragment
